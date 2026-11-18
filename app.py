@@ -14,11 +14,11 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
 
 origins = [
-    item.strip()
-    for item in os.environ.get(
+    s.strip()
+    for s in os.environ.get(
         "ALLOWED_ORIGINS", ""
     ).split(",")
-    if item.strip()
+    if s.strip()
 ]
 
 CORS(
@@ -39,7 +39,8 @@ def home():
         "supported": [
             "DOCX to PDF",
             "PPTX to PDF",
-            "PDF to DOCX"
+            "PDF to DOCX",
+            "PDF to PPTX (image slides)"
         ]
     })
 
@@ -68,16 +69,14 @@ def convert():
     filename = secure_filename(uploaded.filename)
     extension = Path(filename).suffix.lower()
 
-    # 기존 FileGo는 to 값을 보내지 않으므로
-    # 기본 출력 형식을 PDF로 유지합니다.
-    target = request.form.get(
-        "to", "pdf"
-    ).lower()
+    # 기존 클라이언트 호환성을 위해 기본값은 pdf
+    target = request.form.get("to", "pdf").lower()
 
     supported = {
         (".docx", "pdf"),
         (".pptx", "pdf"),
-        (".pdf", "docx")
+        (".pdf", "docx"),
+        (".pdf", "pptx")
     }
 
     if (extension, target) not in supported:
@@ -88,6 +87,7 @@ def convert():
     with tempfile.TemporaryDirectory(
         prefix="filego_"
     ) as temp:
+
         root = Path(temp)
 
         input_file = root / (
@@ -101,13 +101,11 @@ def convert():
         uploaded.save(input_file)
 
         try:
-            if extension == ".pdf":
-                # PDF -> Word
+            # PDF → Word
+            if extension == ".pdf" and target == "docx":
                 from pdf2docx import Converter
 
-                converter = Converter(
-                    str(input_file)
-                )
+                converter = Converter(str(input_file))
 
                 try:
                     converter.convert(
@@ -116,8 +114,80 @@ def convert():
                 finally:
                     converter.close()
 
+            # PDF → PPT (페이지를 이미지 슬라이드로)
+            elif extension == ".pdf" and target == "pptx":
+                import fitz
+                from pptx import Presentation
+                from pptx.util import Inches
+
+                pdf = fitz.open(str(input_file))
+
+                try:
+                    if pdf.is_encrypted:
+                        return jsonify({
+                            "error": "암호화된 PDF는 지원하지 않습니다."
+                        }), 400
+
+                    if pdf.page_count == 0 or pdf.page_count > 30:
+                        return jsonify({
+                            "error": "PDF → PPT는 1~30페이지를 지원합니다."
+                        }), 400
+
+                    presentation = Presentation()
+
+                    presentation.slide_width = Inches(10)
+                    presentation.slide_height = Inches(7.5)
+
+                    blank_layout = presentation.slide_layouts[6]
+
+                    for page in pdf:
+                        pix = page.get_pixmap(
+                            matrix=fitz.Matrix(1.5, 1.5),
+                            alpha=False
+                        )
+
+                        slide = presentation.slides.add_slide(
+                            blank_layout
+                        )
+
+                        page_ratio = pix.width / pix.height
+
+                        slide_ratio = (
+                            presentation.slide_width /
+                            presentation.slide_height
+                        )
+
+                        if page_ratio >= slide_ratio:
+                            width = presentation.slide_width
+                            height = int(width / page_ratio)
+                            left = 0
+                            top = int(
+                                (presentation.slide_height - height) / 2
+                            )
+                        else:
+                            height = presentation.slide_height
+                            width = int(height * page_ratio)
+                            left = int(
+                                (presentation.slide_width - width) / 2
+                            )
+                            top = 0
+
+                        slide.shapes.add_picture(
+                            BytesIO(pix.tobytes("png")),
+                            left,
+                            top,
+                            width=width,
+                            height=height
+                        )
+
+                    presentation.save(
+                        str(output_file)
+                    )
+                finally:
+                    pdf.close()
+
+            # Word/PPT → PDF
             else:
-                # Word/PPT -> PDF
                 output_dir = root / "output"
                 output_dir.mkdir()
 
@@ -141,9 +211,7 @@ def convert():
                     check=False
                 )
 
-                output_file = (
-                    output_dir / "input.pdf"
-                )
+                output_file = output_dir / "input.pdf"
 
                 if result.returncode != 0:
                     raise RuntimeError(
@@ -166,33 +234,31 @@ def convert():
             )
 
             return jsonify({
-                "error":
-                "파일 변환에 실패했습니다. "
-                "다른 파일로 시도해 주세요."
+                "error": "파일 변환에 실패했습니다."
             }), 500
 
-    if target == "pdf":
-        mime_type = "application/pdf"
-    else:
-        mime_type = (
-            "application/vnd.openxmlformats-"
-            "officedocument.wordprocessingml.document"
+    mime_types = {
+        "pdf": "application/pdf",
+        "docx": (
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+        "pptx": (
+            "application/vnd.openxmlformats-officedocument."
+            "presentationml.presentation"
         )
+    }
 
     return send_file(
         BytesIO(result_data),
-        mimetype=mime_type,
+        mimetype=mime_types[target],
         as_attachment=True,
-        download_name=(
-            "filego-converted." + target
-        )
+        download_name="filego-converted." + target
     )
 
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.environ.get("PORT", 10000)
-        )
+        port=int(os.environ.get("PORT", 10000))
     )
