@@ -2,7 +2,7 @@
 import os
 import tempfile
 import subprocess
-import shutil
+from io import BytesIO
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file
@@ -11,27 +11,24 @@ from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
-# 업로드 최대 크기: 30MB
 app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
 
-# 개발 단계에서만 사용합니다.
-# 실제 FileGo 주소가 정해지면 허용 주소를 제한합니다.
-allowed_origins = os.environ.get("ALLOWED_ORIGINS", "").split(",")
+origins = [
+    item.strip()
+    for item in os.environ.get(
+        "ALLOWED_ORIGINS", ""
+    ).split(",")
+    if item.strip()
+]
 
 CORS(
     app,
     resources={
         r"/api/*": {
-            "origins": (
-                [x.strip() for x in allowed_origins if x.strip()]
-                if any(x.strip() for x in allowed_origins)
-                else []
-            )
+            "origins": origins
         }
-    },
+    }
 )
-
-ALLOWED_EXTENSIONS = {"docx", "pptx"}
 
 
 @app.get("/")
@@ -41,7 +38,8 @@ def home():
         "status": "running",
         "supported": [
             "DOCX to PDF",
-            "PPTX to PDF"
+            "PPTX to PDF",
+            "PDF to DOCX"
         ]
     })
 
@@ -52,7 +50,7 @@ def health():
 
 
 @app.errorhandler(413)
-def file_too_large(error):
+def too_large(error):
     return jsonify({
         "error": "파일 크기는 최대 30MB입니다."
     }), 413
@@ -62,98 +60,139 @@ def file_too_large(error):
 def convert():
     uploaded = request.files.get("file")
 
-    if uploaded is None:
+    if uploaded is None or not uploaded.filename:
         return jsonify({
-            "error": "파일이 업로드되지 않았습니다."
+            "error": "파일을 선택해 주세요."
         }), 400
 
-    if not uploaded.filename:
+    filename = secure_filename(uploaded.filename)
+    extension = Path(filename).suffix.lower()
+
+    # 기존 FileGo는 to 값을 보내지 않으므로
+    # 기본 출력 형식을 PDF로 유지합니다.
+    target = request.form.get(
+        "to", "pdf"
+    ).lower()
+
+    supported = {
+        (".docx", "pdf"),
+        (".pptx", "pdf"),
+        (".pdf", "docx")
+    }
+
+    if (extension, target) not in supported:
         return jsonify({
-            "error": "파일 이름이 없습니다."
+            "error": "지원하지 않는 변환입니다."
         }), 400
 
-    original_name = secure_filename(uploaded.filename)
+    with tempfile.TemporaryDirectory(
+        prefix="filego_"
+    ) as temp:
+        root = Path(temp)
 
-    if not original_name:
-        return jsonify({
-            "error": "올바르지 않은 파일 이름입니다."
-        }), 400
+        input_file = root / (
+            "input" + extension
+        )
 
-    extension = Path(original_name).suffix.lower().lstrip(".")
+        output_file = root / (
+            "input." + target
+        )
 
-    if extension not in ALLOWED_EXTENSIONS:
-        return jsonify({
-            "error": "DOCX 또는 PPTX 파일만 지원합니다."
-        }), 400
-
-    with tempfile.TemporaryDirectory(prefix="filego_") as workdir:
-        input_dir = Path(workdir) / "input"
-        output_dir = Path(workdir) / "output"
-        profile_dir = Path(workdir) / "lo-profile"
-
-        input_dir.mkdir()
-        output_dir.mkdir()
-
-        # 서버 내부에서는 고정된 파일명을 사용합니다.
-        input_path = input_dir / f"document.{extension}"
-        output_path = output_dir / "document.pdf"
-
-        uploaded.save(input_path)
-
-        command = [
-            "libreoffice",
-            "-env:UserInstallation=file://" + str(profile_dir),
-            "--headless",
-            "--convert-to",
-            "pdf",
-            "--outdir",
-            str(output_dir),
-            str(input_path),
-        ]
+        uploaded.save(input_file)
 
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=90,
-                check=False,
+            if extension == ".pdf":
+                # PDF -> Word
+                from pdf2docx import Converter
+
+                converter = Converter(
+                    str(input_file)
+                )
+
+                try:
+                    converter.convert(
+                        str(output_file)
+                    )
+                finally:
+                    converter.close()
+
+            else:
+                # Word/PPT -> PDF
+                output_dir = root / "output"
+                output_dir.mkdir()
+
+                command = [
+                    "libreoffice",
+                    "-env:UserInstallation=file://" +
+                    str(root / "lo-profile"),
+                    "--headless",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    str(output_dir),
+                    str(input_file)
+                ]
+
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                    check=False
+                )
+
+                output_file = (
+                    output_dir / "input.pdf"
+                )
+
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        "LibreOffice conversion failed"
+                    )
+
+            if (
+                not output_file.exists()
+                or output_file.stat().st_size == 0
+            ):
+                raise RuntimeError(
+                    "Output file was not created"
+                )
+
+            result_data = output_file.read_bytes()
+
+        except Exception:
+            app.logger.exception(
+                "File conversion failed"
             )
-        except subprocess.TimeoutExpired:
+
             return jsonify({
-                "error": "변환 시간이 초과되었습니다."
-            }), 504
-        except OSError:
-            app.logger.exception("LibreOffice execution failed")
-            return jsonify({
-                "error": "변환 프로그램을 실행하지 못했습니다."
+                "error":
+                "파일 변환에 실패했습니다. "
+                "다른 파일로 시도해 주세요."
             }), 500
 
-        if result.returncode != 0 or not output_path.exists():
-            app.logger.error(
-                "Conversion failed: %s %s",
-                result.stdout,
-                result.stderr,
-            )
-            return jsonify({
-                "error": "파일 변환에 실패했습니다."
-            }), 500
-
-        # 임시 폴더가 삭제되기 전에 결과를 메모리로 읽습니다.
-        pdf_data = output_path.read_bytes()
-
-    from io import BytesIO
+    if target == "pdf":
+        mime_type = "application/pdf"
+    else:
+        mime_type = (
+            "application/vnd.openxmlformats-"
+            "officedocument.wordprocessingml.document"
+        )
 
     return send_file(
-        BytesIO(pdf_data),
-        mimetype="application/pdf",
+        BytesIO(result_data),
+        mimetype=mime_type,
         as_attachment=True,
-        download_name="filego-converted.pdf",
+        download_name=(
+            "filego-converted." + target
+        )
     )
 
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
+        port=int(
+            os.environ.get("PORT", 10000)
+        )
     )
